@@ -22,6 +22,11 @@ from openpyxl.utils.datetime import (
 )
 
 
+# Version 1.1.0 adds chronological sorting by Visit Date and Visit Time to
+# every worksheet changed during report generation.
+APP_VERSION = "1.1.0"
+
+
 ALCOHOL = "Alcohol"
 HOME_DELIVERY = "Supermarket Home Delivery"
 E_CIG = "E-Cig"
@@ -761,6 +766,77 @@ class OOXMLWorkbook:
             target_row.set("spans", f"1:{len(values)}")
         return target_row_number
 
+    def sort_data_rows(self, sheet_name, column_count):
+        """Sort populated data rows by Visit Date and Visit Time, oldest first."""
+        records = []
+        populated_row_numbers = []
+        for row in self.rows(sheet_name):
+            row_number = self._row_number(row)
+            if row_number < 2:
+                continue
+            store_number = self.cell_value(self.cell_in_row(row, 1))
+            if store_number in (None, ""):
+                continue
+
+            values = [
+                self.cell_value(self.cell_in_row(row, column_number))
+                for column_number in range(1, column_count + 1)
+            ]
+            visit_date = parse_date_value(values[2], self.epoch)
+            visit_time = parse_time_value(values[3], self.epoch)
+            records.append(
+                (visit_date, visit_time, row_number, values)
+            )
+            populated_row_numbers.append(row_number)
+
+        if not records:
+            return
+
+        records.sort(
+            key=lambda record: (
+                record[0] is None,
+                record[0] or date.max,
+                record[1] is None,
+                24 if record[1] is None else record[1].hour,
+                60 if record[1] is None else record[1].minute,
+                record[2],
+            )
+        )
+
+        style_row = self.row_by_number(sheet_name, 2)
+        if style_row is None:
+            style_row = self.row_by_number(sheet_name, populated_row_numbers[0])
+
+        last_original_row = max(populated_row_numbers)
+        for row_number in range(2, last_original_row + 1):
+            row = self.row_by_number(sheet_name, row_number)
+            if row is None:
+                continue
+            for column_number in range(1, column_count + 1):
+                cell = self.cell_in_row(row, column_number)
+                if cell is not None:
+                    self._write_value(cell, None)
+
+        for target_row_number, (_, _, _, values) in enumerate(records, start=2):
+            target_row = self._ensure_row(
+                sheet_name, target_row_number, style_row
+            )
+            for column_number, value in enumerate(values, start=1):
+                target_cell = self.cell_in_row(target_row, column_number)
+                if target_cell is None:
+                    style_cell = (
+                        None
+                        if style_row is None
+                        else self.cell_in_row(style_row, column_number)
+                    )
+                    target_cell = self._ensure_cell(
+                        target_row, column_number, style_cell
+                    )
+                self._write_value(target_cell, value)
+                self._update_dimension(
+                    sheet_name, target_row_number, column_number
+                )
+
     def existing_visit_keys(self, sheet_filter):
         keys = set()
         for sheet_name in self.sheet_names:
@@ -1124,6 +1200,7 @@ def generate_reports(
     }
     main_seen = main.existing_visit_keys(main_detail_sheet)
     whoosh_seen = whoosh.existing_visit_keys(whoosh_period_sheet)
+    touched_main_sheets = {}
     touched_whoosh_periods = set()
 
     for _, row in export.iterrows():
@@ -1171,11 +1248,16 @@ def generate_reports(
         template_sheet = find_main_template(main, suffix, headers, period)
         main.ensure_headers(sheet_name, headers, template_sheet)
         main.append_values(sheet_name, values, template_sheet)
+        touched_main_sheets[sheet_name] = len(headers)
         main_seen.add(key)
         stats[audit_type]["Added"] += 1
 
+    for sheet_name, column_count in touched_main_sheets.items():
+        main.sort_data_rows(sheet_name, column_count)
+
     for period in touched_whoosh_periods:
         sheet_name = get_whoosh_period_sheet(whoosh, period)
+        whoosh.sort_data_rows(sheet_name, len(WHOOSH_HEADERS))
         whoosh.recalculate_first_or_second(sheet_name)
 
     return GenerationResult(
@@ -1205,6 +1287,9 @@ def main():
         layout="centered",
     )
     st.title("Tesco Ireland Weekly Report Generator")
+    st.caption(
+        f"Version {APP_VERSION} — chronological sorting enabled for updated tabs"
+    )
     st.write(
         "Upload the latest audits export, Tesco calendar and the most recent "
         "main and Whoosh reports. The app will add new visits to the correct "
@@ -1220,6 +1305,7 @@ The app will:
 - map E-Cig audits to **Px Vape Details**
 - map Rapid Delivery audits to the Whoosh **Px** tabs
 - de-duplicate visits using Store Number, local visit date and local visit time
+- sort each updated tab chronologically by visit date and visit time
 - set Whoosh visits to **First** or **Second** within each store and period
 """
     )
