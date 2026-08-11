@@ -22,9 +22,9 @@ from openpyxl.utils.datetime import (
 )
 
 
-# Version 1.1.0 adds chronological sorting by Visit Date and Visit Time to
-# every worksheet changed during report generation.
-APP_VERSION = "1.1.0"
+# Version 1.2.0 adds automatic reporting-year rollover while retaining the
+# chronological sorting introduced in version 1.1.0.
+APP_VERSION = "1.2.0"
 
 
 ALCOHOL = "Alcohol"
@@ -140,6 +140,9 @@ class GenerationResult:
     main_filename: str
     whoosh_filename: str
     reporting_week: int
+    reporting_year_start: int
+    reporting_year_end: int
+    year_rollover: bool
     stats: dict
     ignored_rows: int
 
@@ -156,6 +159,30 @@ def normalise_header(value):
 
 def normalise_sheet_name(value):
     return re.sub(r"\s+", " ", clean_text(value)).casefold()
+
+
+REPORT_YEAR_PATTERN = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})\s*(?:[-_]|to)?\s*((?:19|20)\d{2})(?!\d)",
+    flags=re.I,
+)
+
+
+def calendar_reporting_years(calendar):
+    dates = sorted(calendar)
+    if not dates:
+        raise ValueError("The calendar does not contain any valid dates.")
+    start_year = dates[0].year
+    end_year = start_year + 1
+    if dates[-1].year > end_year:
+        raise ValueError("The calendar spans more than one reporting year.")
+    return start_year, end_year
+
+
+def filename_reporting_years(filename):
+    match = REPORT_YEAR_PATTERN.search(PurePosixPath(filename or "").name)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def parse_store_number(value):
@@ -350,8 +377,9 @@ def read_calendar(calendar_bytes):
     candidates = []
     try:
         for worksheet in workbook.worksheets:
-            max_column = min(worksheet.max_column, 60)
-            for header_row in range(1, min(worksheet.max_row, 12) + 1):
+            max_column = min(worksheet.max_column or 60, 60)
+            header_search_rows = min(worksheet.max_row or 12, 12)
+            for header_row in range(1, header_search_rows + 1):
                 values = next(
                     worksheet.iter_rows(
                         min_row=header_row,
@@ -376,7 +404,6 @@ def read_calendar(calendar_bytes):
                 mapping = {}
                 for row in worksheet.iter_rows(
                     min_row=header_row + 1,
-                    max_row=worksheet.max_row,
                     max_col=max(positions.values()),
                     values_only=True,
                 ):
@@ -860,6 +887,41 @@ class OOXMLWorkbook:
                     keys.add(key)
         return keys
 
+    def existing_visit_dates(self, sheet_filter):
+        dates = []
+        for sheet_name in self.sheet_names:
+            if not sheet_filter(sheet_name):
+                continue
+            for row in self.rows(sheet_name):
+                if self._row_number(row) < 2:
+                    continue
+                visit_date = parse_date_value(
+                    self.cell_value(self.cell_in_row(row, 3)), self.epoch
+                )
+                if visit_date is not None:
+                    dates.append(visit_date)
+        return dates
+
+    def clear_data_rows(self, sheet_filter):
+        """Clear data values while retaining row, cell and style structure."""
+        cleared_rows = 0
+        for sheet_name in self.sheet_names:
+            if not sheet_filter(sheet_name):
+                continue
+            for row in self.rows(sheet_name):
+                if self._row_number(row) < 2:
+                    continue
+                row_had_data = False
+                for cell in row.findall(f"{{{MAIN_NS}}}c"):
+                    if self.cell_value(cell) not in (None, "") or cell.find(
+                        f"{{{MAIN_NS}}}f"
+                    ) is not None:
+                        row_had_data = True
+                    self._write_value(cell, None)
+                if row_had_data:
+                    cleared_rows += 1
+        return cleared_rows
+
     def recalculate_first_or_second(self, sheet_name):
         visits_by_store = {}
         row_lookup = {}
@@ -1009,8 +1071,19 @@ class OOXMLWorkbook:
         calculation.set("fullCalcOnLoad", "1")
         calculation.set("forceFullCalc", "1")
 
+    def _set_pivot_refresh_on_load(self):
+        for part_name in self.parts:
+            if not re.fullmatch(
+                r"xl/pivotCache/pivotCacheDefinition\d+\.xml", part_name
+            ):
+                continue
+            cache_definition = self._parse_part(part_name)
+            cache_definition.set("refreshOnLoad", "1")
+            cache_definition.set("enableRefresh", "1")
+
     def to_bytes(self):
         self._set_recalculation()
+        self._set_pivot_refresh_on_load()
         for part_name, root in self.xml_roots.items():
             self.parts[part_name] = etree.tostring(
                 root,
@@ -1149,11 +1222,15 @@ def map_whoosh_row(row):
     ]
 
 
-def updated_report_filename(original_name, reporting_week):
+def updated_report_filename(original_name, reporting_week, reporting_years):
     name = PurePosixPath(original_name or "report.xlsx").name
     if not name.lower().endswith(".xlsx"):
         name += ".xlsx"
     stem = name[:-5]
+
+    year_label = f"{reporting_years[0]} {reporting_years[1]}"
+    stem, year_count = REPORT_YEAR_PATTERN.subn(year_label, stem, count=1)
+
     replacement = f"(Week {reporting_week})"
     updated, count = re.subn(
         r"\(\s*Week\s*\d+\s*\)", replacement, stem, flags=re.I
@@ -1164,6 +1241,19 @@ def updated_report_filename(original_name, reporting_week):
         )
     if count == 0:
         updated = f"{stem} {replacement}"
+
+    if year_count == 0:
+        week_match = re.search(
+            r"\(?\bWeek\s*\d+\b\s*\)?", updated, flags=re.I
+        )
+        if week_match is not None:
+            updated = (
+                updated[: week_match.start()].rstrip()
+                + f" {year_label} "
+                + updated[week_match.start() :].lstrip()
+            )
+        else:
+            updated = f"{updated} {year_label}"
     return updated + ".xlsx"
 
 
@@ -1177,6 +1267,8 @@ def generate_reports(
 ):
     export, ignored_rows = read_export(export_bytes)
     calendar = read_calendar(calendar_bytes)
+    reporting_years = calendar_reporting_years(calendar)
+    calendar_start = min(calendar)
 
     missing_dates = sorted(
         {visit_date for visit_date in export["_visit_date"] if visit_date not in calendar}
@@ -1193,6 +1285,26 @@ def generate_reports(
 
     main = OOXMLWorkbook(main_report_bytes, "the latest main report")
     whoosh = OOXMLWorkbook(whoosh_report_bytes, "the latest Whoosh report")
+
+    main_dates = main.existing_visit_dates(main_detail_sheet)
+    whoosh_dates = whoosh.existing_visit_dates(whoosh_period_sheet)
+    main_filename_years = filename_reporting_years(main_original_name)
+    whoosh_filename_years = filename_reporting_years(whoosh_original_name)
+
+    reset_main = (
+        main_filename_years is not None
+        and main_filename_years != reporting_years
+    ) or (main_dates and max(main_dates) < calendar_start)
+    reset_whoosh = (
+        whoosh_filename_years is not None
+        and whoosh_filename_years != reporting_years
+    ) or (whoosh_dates and max(whoosh_dates) < calendar_start)
+
+    if reset_main:
+        main.clear_data_rows(main_detail_sheet)
+    if reset_whoosh:
+        whoosh.clear_data_rows(whoosh_period_sheet)
+    year_rollover = bool(reset_main or reset_whoosh)
 
     stats = {
         audit_type: {"Added": 0, "Already present": 0}
@@ -1263,11 +1375,16 @@ def generate_reports(
     return GenerationResult(
         main_report=main.to_bytes(),
         whoosh_report=whoosh.to_bytes(),
-        main_filename=updated_report_filename(main_original_name, reporting_week),
+        main_filename=updated_report_filename(
+            main_original_name, reporting_week, reporting_years
+        ),
         whoosh_filename=updated_report_filename(
-            whoosh_original_name, reporting_week
+            whoosh_original_name, reporting_week, reporting_years
         ),
         reporting_week=reporting_week,
+        reporting_year_start=reporting_years[0],
+        reporting_year_end=reporting_years[1],
+        year_rollover=year_rollover,
         stats=stats,
         ignored_rows=ignored_rows,
     )
@@ -1288,7 +1405,7 @@ def main():
     )
     st.title("Tesco Ireland Weekly Report Generator")
     st.caption(
-        f"Version {APP_VERSION} — chronological sorting enabled for updated tabs"
+        f"Version {APP_VERSION} — chronological sorting and annual rollover enabled"
     )
     st.write(
         "Upload the latest audits export, Tesco calendar and the most recent "
@@ -1307,6 +1424,7 @@ The app will:
 - de-duplicate visits using Store Number, local visit date and local visit time
 - sort each updated tab chronologically by visit date and visit time
 - set Whoosh visits to **First** or **Second** within each store and period
+- detect a new calendar year, reset the previous year's detail tabs and update filenames
 """
     )
 
@@ -1331,13 +1449,16 @@ The app will:
         return
 
     upload_bytes = [uploaded.getvalue() for uploaded in uploads]
-    signature = tuple(
-        (
-            uploaded.name,
-            len(content),
-            hashlib.sha256(content).hexdigest(),
-        )
-        for uploaded, content in zip(uploads, upload_bytes)
+    signature = (
+        APP_VERSION,
+        tuple(
+            (
+                uploaded.name,
+                len(content),
+                hashlib.sha256(content).hexdigest(),
+            )
+            for uploaded, content in zip(uploads, upload_bytes)
+        ),
     )
     if st.session_state.get("tesco_input_signature") != signature:
         st.session_state.pop("tesco_generation_result", None)
@@ -1365,7 +1486,17 @@ The app will:
     if result is None:
         return
 
-    st.success(f"Week {result.reporting_week} reports generated successfully.")
+    reporting_year_label = (
+        f"{result.reporting_year_start}–{result.reporting_year_end}"
+    )
+    st.success(
+        f"{reporting_year_label} Week {result.reporting_week} reports generated successfully."
+    )
+    if result.year_rollover:
+        st.info(
+            "A new reporting year was detected. Previous-year detail rows were "
+            "cleared before the new visits were added."
+        )
     summary_rows = []
     for audit_type in SUPPORTED_TYPES:
         summary_rows.append(
@@ -1399,7 +1530,10 @@ The app will:
     st.download_button(
         "Download both reports as ZIP",
         data=make_download_zip(result),
-        file_name=f"Tesco Ireland Reports - Week {result.reporting_week}.zip",
+        file_name=(
+            f"Tesco Ireland Reports {result.reporting_year_start} "
+            f"{result.reporting_year_end} - Week {result.reporting_week}.zip"
+        ),
         mime="application/zip",
         use_container_width=True,
     )
