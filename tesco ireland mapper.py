@@ -22,9 +22,9 @@ from openpyxl.utils.datetime import (
 )
 
 
-# Version 1.2.0 adds automatic reporting-year rollover while retaining the
-# chronological sorting introduced in version 1.1.0.
-APP_VERSION = "1.2.0"
+# Version 1.4.1 makes the previous Deliveroo file required and maps unusual
+# visit details directly from the audits export.
+APP_VERSION = "1.4.1"
 
 
 ALCOHOL = "Alcohol"
@@ -76,6 +76,73 @@ RAPID_ORDER_REFERENCE = (
     "Please enter the order number from your online receipt "
     "(including any special characters):"
 )
+
+RAPID_PRODUCT = "Please give details of the age restricted product(s) purchased:"
+RAPID_AGE = "What is your age?"
+RAPID_ASKED_AGE = "Did the driver ask your age?"
+RAPID_ASKED_DOB = "Did the driver ask for your date of birth?"
+RAPID_ENTERED_DOB = "Did the driver input your date of birth into their device?"
+RAPID_SIGNED = "Were you asked to sign for delivery?"
+RAPID_DAMAGED = "Were any of the items damaged?"
+RAPID_DRIVER_GENDER = "What was the gender of the driver?"
+RAPID_DRIVER_DESCRIPTION = "Please accurately describe the driver:"
+RAPID_EYE_CONTACT = (
+    "Did the driver make eye contact with you during the interaction?"
+)
+RAPID_FRIENDLY = "Was the driver friendly?"
+RAPID_PHOTO = (
+    "Did you see the delivery driver take a photo of the delivery bag at your door?"
+)
+RAPID_CONVERSATION = "Did the delivery driver engage in any conversation with you?"
+RAPID_DRIVER_SAID = "What did the driver say?"
+RAPID_ONLINE_SCORE = (
+    "Based on your online shopping experience, please rate the service from 1 to 10 "
+    "(where 1 is very poor and 10 is excellent):"
+)
+RAPID_SCORE_REASON = "Please explain the reason for your score:"
+RAPID_DELIVERY_SCORE = (
+    "Based on your delivery experience, please rate your experience from 1 to 10 "
+    "(where 1 is very poor and 10 is excellent):"
+)
+RAPID_COURIER_ID = "Please confirm below if the courier asked for ID?"
+RAPID_UNUSUAL = (
+    "Please use this space to explain anything unusual about your visit or "
+    "to clarify any detail of your report:"
+)
+
+DELIVEROO_RAW_HEADERS = [
+    "ORDER",
+    "CLIENT",
+    "VISIT",
+    "SITE",
+    "PREMISES",
+    "SITE CODE",
+    "DATE OF VISIT",
+    "TIME OF VISIT",
+    "RESULT",
+    RAPID_AGE,
+    "What is the name of the restaurant/shop you made the purchase from?",
+    "Please enter the 11-digit order number:",
+    "Please give details of the product that you purchased:",
+    RAPID_ASKED_AGE,
+    DRIVER_ASKED_ID,
+    RAPID_ASKED_DOB,
+    RAPID_ENTERED_DOB,
+    RAPID_SIGNED,
+    RAPID_DAMAGED,
+    RAPID_DRIVER_GENDER,
+    RAPID_DRIVER_DESCRIPTION,
+    RAPID_EYE_CONTACT,
+    RAPID_FRIENDLY,
+    RAPID_PHOTO,
+    RAPID_CONVERSATION,
+    RAPID_DRIVER_SAID,
+    RAPID_ONLINE_SCORE,
+    RAPID_SCORE_REASON,
+    RAPID_DELIVERY_SCORE,
+    RAPID_UNUSUAL,
+    RAPID_COURIER_ID + " ",
+]
 
 STORE_HEADERS = [
     "Store Number",
@@ -145,6 +212,9 @@ class GenerationResult:
     year_rollover: bool
     stats: dict
     ignored_rows: int
+    deliveroo_raw_data: bytes = None
+    deliveroo_filename: str = None
+    deliveroo_new_rows: int = None
 
 
 def clean_text(value):
@@ -272,23 +342,30 @@ def row_identifier(row, fallback_index):
     return internal_id or f"CSV row {fallback_index + 2}"
 
 
-def read_export(export_bytes):
+def read_csv_bytes(csv_bytes, label):
     try:
         df = pd.read_csv(
-            io.BytesIO(export_bytes),
+            io.BytesIO(csv_bytes),
             dtype=str,
             keep_default_na=False,
             encoding="utf-8-sig",
         )
     except UnicodeDecodeError:
         df = pd.read_csv(
-            io.BytesIO(export_bytes),
+            io.BytesIO(csv_bytes),
             dtype=str,
             keep_default_na=False,
             encoding="cp1252",
         )
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError(f"{label} is empty.") from exc
 
     df.columns = [clean_text(column) for column in df.columns]
+    return df
+
+
+def read_export(export_bytes):
+    df = read_csv_bytes(export_bytes, "The audits export")
     missing = sorted(BASE_EXPORT_COLUMNS - set(df.columns))
     if missing:
         raise KeyError("The export is missing required column(s): " + ", ".join(missing))
@@ -1257,6 +1334,123 @@ def updated_report_filename(original_name, reporting_week, reporting_years):
     return updated + ".xlsx"
 
 
+DELIVEROO_RAW_SOURCE_MAP = {
+    "ORDER": "order_internal_id",
+    "CLIENT": "client_name",
+    "VISIT": "internal_id",
+    "SITE": "site_internal_id",
+    "PREMISES": "site_name",
+    "DATE OF VISIT": "date_of_visit_local",
+    "TIME OF VISIT": "time_of_visit_local",
+    "RESULT": "primary_result",
+    RAPID_AGE: RAPID_AGE,
+    "What is the name of the restaurant/shop you made the purchase from?": "site_name",
+    "Please enter the 11-digit order number:": RAPID_ORDER_REFERENCE,
+    "Please give details of the product that you purchased:": RAPID_PRODUCT,
+    RAPID_ASKED_AGE: RAPID_ASKED_AGE,
+    DRIVER_ASKED_ID: DRIVER_ASKED_ID,
+    RAPID_ASKED_DOB: RAPID_ASKED_DOB,
+    RAPID_ENTERED_DOB: RAPID_ENTERED_DOB,
+    RAPID_SIGNED: RAPID_SIGNED,
+    RAPID_DAMAGED: RAPID_DAMAGED,
+    RAPID_DRIVER_GENDER: RAPID_DRIVER_GENDER,
+    RAPID_DRIVER_DESCRIPTION: RAPID_DRIVER_DESCRIPTION,
+    RAPID_EYE_CONTACT: RAPID_EYE_CONTACT,
+    RAPID_FRIENDLY: RAPID_FRIENDLY,
+    RAPID_PHOTO: RAPID_PHOTO,
+    RAPID_CONVERSATION: RAPID_CONVERSATION,
+    RAPID_DRIVER_SAID: RAPID_DRIVER_SAID,
+    RAPID_ONLINE_SCORE: RAPID_ONLINE_SCORE,
+    RAPID_SCORE_REASON: RAPID_SCORE_REASON,
+    RAPID_DELIVERY_SCORE: RAPID_DELIVERY_SCORE,
+    RAPID_UNUSUAL: RAPID_UNUSUAL,
+    RAPID_COURIER_ID + " ": RAPID_COURIER_ID,
+}
+
+
+def updated_deliveroo_filename(original_name, output_date=None):
+    output_date = output_date or date.today()
+    date_text = output_date.strftime("%d.%m.%y")
+    name = PurePosixPath(
+        original_name or "Deliveroo Whoosh Ireland Raw Data.csv"
+    ).name
+    stem = name[:-4] if name.lower().endswith(".csv") else name
+    updated, count = re.subn(
+        r"\d{2}[.]\d{2}[.]\d{2,4}$", date_text, stem
+    )
+    if count == 0:
+        updated = f"{stem.rstrip()} {date_text}"
+    return updated + ".csv"
+
+
+def generate_deliveroo_raw_data(
+    export_bytes,
+    previous_raw_bytes,
+    previous_raw_name="Deliveroo Whoosh Ireland Raw Data.csv",
+    output_date=None,
+):
+    export = read_csv_bytes(export_bytes, "The audits export")
+    previous = read_csv_bytes(
+        previous_raw_bytes, "The previous Deliveroo raw-data file"
+    )
+
+    required_export_columns = {
+        "item_to_order",
+        "site_code",
+        *DELIVEROO_RAW_SOURCE_MAP.values(),
+    }
+    missing_export = sorted(required_export_columns - set(export.columns))
+    if missing_export:
+        raise KeyError(
+            "The audits export is missing Deliveroo raw-data column(s): "
+            + "; ".join(missing_export)
+        )
+    if "VISIT" not in previous.columns:
+        raise KeyError(
+            "The previous Deliveroo raw-data file is missing the VISIT column."
+        )
+
+    rapid = export[
+        export["item_to_order"].map(normalise_header)
+        == normalise_header(RAPID_DELIVERY)
+    ].copy()
+    if rapid["internal_id"].map(clean_text).eq("").any():
+        raise ValueError(
+            "A Rapid Delivery audit has no internal_id and cannot be de-duplicated."
+        )
+
+    existing_visits = {
+        clean_text(value) for value in previous["VISIT"] if clean_text(value)
+    }
+    rapid = rapid[
+        ~rapid["internal_id"].map(clean_text).isin(existing_visits)
+    ].copy()
+    rapid["_sort_date"] = pd.to_datetime(
+        rapid["date_of_visit_local"], dayfirst=True, errors="coerce"
+    )
+    rapid.sort_values("_sort_date", kind="stable", inplace=True)
+
+    output = pd.DataFrame(index=rapid.index)
+    for header in DELIVEROO_RAW_HEADERS:
+        if header == "SITE CODE":
+            output[header] = rapid["site_code"].map(
+                lambda value: (
+                    ""
+                    if parse_store_number(value) is None
+                    else str(parse_store_number(value))
+                )
+            )
+        else:
+            output[header] = rapid[DELIVEROO_RAW_SOURCE_MAP[header]]
+
+    csv_text = output.to_csv(index=False, lineterminator="\r\n")
+    return (
+        csv_text.encode("utf-8-sig"),
+        updated_deliveroo_filename(previous_raw_name, output_date),
+        len(output),
+    )
+
+
 def generate_reports(
     export_bytes,
     calendar_bytes,
@@ -1264,6 +1458,9 @@ def generate_reports(
     whoosh_report_bytes,
     main_original_name="Test Purchase Report.xlsx",
     whoosh_original_name="Test Purchase Report Whoosh.xlsx",
+    previous_deliveroo_bytes=None,
+    previous_deliveroo_name="Deliveroo Whoosh Ireland Raw Data.csv",
+    output_date=None,
 ):
     export, ignored_rows = read_export(export_bytes)
     calendar = read_calendar(calendar_bytes)
@@ -1372,6 +1569,21 @@ def generate_reports(
         whoosh.sort_data_rows(sheet_name, len(WHOOSH_HEADERS))
         whoosh.recalculate_first_or_second(sheet_name)
 
+    deliveroo_raw_data = None
+    deliveroo_filename = None
+    deliveroo_new_rows = None
+    if previous_deliveroo_bytes is not None:
+        (
+            deliveroo_raw_data,
+            deliveroo_filename,
+            deliveroo_new_rows,
+        ) = generate_deliveroo_raw_data(
+            export_bytes,
+            previous_deliveroo_bytes,
+            previous_deliveroo_name,
+            output_date,
+        )
+
     return GenerationResult(
         main_report=main.to_bytes(),
         whoosh_report=whoosh.to_bytes(),
@@ -1387,6 +1599,9 @@ def generate_reports(
         year_rollover=year_rollover,
         stats=stats,
         ignored_rows=ignored_rows,
+        deliveroo_raw_data=deliveroo_raw_data,
+        deliveroo_filename=deliveroo_filename,
+        deliveroo_new_rows=deliveroo_new_rows,
     )
 
 
@@ -1395,6 +1610,10 @@ def make_download_zip(result):
     with ZipFile(output, "w", ZIP_DEFLATED) as archive:
         archive.writestr(result.main_filename, result.main_report)
         archive.writestr(result.whoosh_filename, result.whoosh_report)
+        if result.deliveroo_raw_data is not None:
+            archive.writestr(
+                result.deliveroo_filename, result.deliveroo_raw_data
+            )
     return output.getvalue()
 
 
@@ -1405,7 +1624,7 @@ def main():
     )
     st.title("Tesco Ireland Weekly Report Generator")
     st.caption(
-        f"Version {APP_VERSION} — chronological sorting and annual rollover enabled"
+        f"Version {APP_VERSION} — Tesco reporting and Deliveroo raw data"
     )
     st.write(
         "Upload the latest audits export, Tesco calendar and the most recent "
@@ -1425,6 +1644,7 @@ The app will:
 - sort each updated tab chronologically by visit date and visit time
 - set Whoosh visits to **First** or **Second** within each store and period
 - detect a new calendar year, reset the previous year's detail tabs and update filenames
+- generate a Deliveroo raw-data CSV containing only new Rapid Delivery visits
 """
     )
 
@@ -1438,26 +1658,34 @@ The app will:
     whoosh_report_file = st.file_uploader(
         "Upload the most recent Whoosh Report", type=["xlsx"]
     )
+    deliveroo_raw_file = st.file_uploader(
+        "Upload the most recent Deliveroo Whoosh Ireland Raw Data file",
+        type=["csv"],
+    )
 
     uploads = [
         export_file,
         calendar_file,
         main_report_file,
         whoosh_report_file,
+        deliveroo_raw_file,
     ]
     if not all(uploads):
         return
 
     upload_bytes = [uploaded.getvalue() for uploaded in uploads]
+    signature_files = uploads
     signature = (
         APP_VERSION,
         tuple(
-            (
+            None
+            if uploaded is None
+            else (
                 uploaded.name,
-                len(content),
-                hashlib.sha256(content).hexdigest(),
+                len(uploaded.getvalue()),
+                hashlib.sha256(uploaded.getvalue()).hexdigest(),
             )
-            for uploaded, content in zip(uploads, upload_bytes)
+            for uploaded in signature_files
         ),
     )
     if st.session_state.get("tesco_input_signature") != signature:
@@ -1474,6 +1702,8 @@ The app will:
                     whoosh_report_bytes=upload_bytes[3],
                     main_original_name=main_report_file.name,
                     whoosh_original_name=whoosh_report_file.name,
+                    previous_deliveroo_bytes=upload_bytes[4],
+                    previous_deliveroo_name=deliveroo_raw_file.name,
                 )
         except (KeyError, ValueError, BadZipFile) as exc:
             st.session_state.pop("tesco_generation_result", None)
@@ -1513,6 +1743,12 @@ The app will:
             f"{result.ignored_rows} row(s) with other audit types were ignored."
         )
 
+    if result.deliveroo_raw_data is not None:
+        st.info(
+            f"Deliveroo raw data contains {result.deliveroo_new_rows} new "
+            "Rapid Delivery visit(s); previous rows are not included."
+        )
+
     st.download_button(
         "Download Test Purchase Report",
         data=result.main_report,
@@ -1527,8 +1763,20 @@ The app will:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+    if result.deliveroo_raw_data is not None:
+        st.download_button(
+            "Download Deliveroo Whoosh Ireland Raw Data",
+            data=result.deliveroo_raw_data,
+            file_name=result.deliveroo_filename,
+            mime="text/csv",
+            use_container_width=True,
+        )
     st.download_button(
-        "Download both reports as ZIP",
+        (
+            "Download all generated files as ZIP"
+            if result.deliveroo_raw_data is not None
+            else "Download both reports as ZIP"
+        ),
         data=make_download_zip(result),
         file_name=(
             f"Tesco Ireland Reports {result.reporting_year_start} "
