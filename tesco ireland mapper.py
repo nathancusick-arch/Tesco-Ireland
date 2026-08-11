@@ -1624,7 +1624,7 @@ def main():
     )
     st.title("Tesco Ireland Weekly Report Generator")
     st.caption(
-        f"Version {APP_VERSION} — Tesco reporting and Deliveroo raw data"
+        f"Version {APP_VERSION} — chronological sorting, annual rollover and Deliveroo raw data added"
     )
     st.write(
         "Upload the latest audits export, Tesco calendar and the most recent "
