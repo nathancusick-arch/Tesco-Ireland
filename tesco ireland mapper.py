@@ -22,22 +22,32 @@ from openpyxl.utils.datetime import (
 )
 
 
-# Version 1.4.1 makes the previous Deliveroo file required and maps unusual
-# visit details directly from the audits export.
-APP_VERSION = "1.4.1"
+# Version 1.5.0 adds Click & Collect reporting for Tesco's 2026-2027 template.
+APP_VERSION = "1.5.0"
 
 
 ALCOHOL = "Alcohol"
 HOME_DELIVERY = "Supermarket Home Delivery"
 E_CIG = "E-Cig"
+CLICK_COLLECT = "Click & Collect"
 RAPID_DELIVERY = "Rapid Delivery"
 
-SUPPORTED_TYPES = (ALCOHOL, HOME_DELIVERY, E_CIG, RAPID_DELIVERY)
+SUPPORTED_TYPES = (
+    ALCOHOL,
+    HOME_DELIVERY,
+    E_CIG,
+    CLICK_COLLECT,
+    RAPID_DELIVERY,
+)
 TYPE_ALIASES = {
     "alcohol": ALCOHOL,
     "supermarket home delivery": HOME_DELIVERY,
     "e-cig": E_CIG,
     "e-cigarette": E_CIG,
+    "click & collect": CLICK_COLLECT,
+    "click and collect": CLICK_COLLECT,
+    "click-and-collect": CLICK_COLLECT,
+    "cnc": CLICK_COLLECT,
     "rapid delivery": RAPID_DELIVERY,
 }
 
@@ -51,6 +61,7 @@ BASE_EXPORT_COLUMNS = {
 }
 
 STAFF_ASKED_ID = "Did the staff member who served you ask for ID?"
+CNC_ASKED_ID = "Please confirm below whether or not you were asked for ID:"
 TILL_TYPE = "At which type of till was the purchase made?"
 CHECKOUT_NUMBER = "What was the number of the checkout till you used?"
 STAFF_NAME = "What was the name of the staff member who served you?"
@@ -158,6 +169,8 @@ STORE_HEADERS = [
 ]
 
 VAPE_HEADERS = STORE_HEADERS[:9]
+
+CNC_HEADERS = STORE_HEADERS[:6]
 
 DOT_COM_HEADERS = [
     "Store Number",
@@ -378,7 +391,7 @@ def read_export(export_bytes):
     if supported.empty:
         raise ValueError(
             "The export does not contain Alcohol, Supermarket Home Delivery, "
-            "E-Cig or Rapid Delivery audits."
+            "E-Cig, Click & Collect or Rapid Delivery audits."
         )
 
     present_types = set(supported["_audit_type"])
@@ -410,6 +423,14 @@ def read_export(export_bytes):
         )
     if RAPID_DELIVERY in present_types:
         required_questions.update({DRIVER_ASKED_ID, RAPID_ORDER_REFERENCE})
+
+    if CLICK_COLLECT in present_types and not {
+        STAFF_ASKED_ID,
+        CNC_ASKED_ID,
+    }.intersection(df.columns):
+        raise KeyError(
+            "The export is missing the Click & Collect Asked for ID question."
+        )
 
     missing_questions = sorted(required_questions - set(df.columns))
     if missing_questions:
@@ -833,6 +854,109 @@ class OOXMLWorkbook:
             self._write_value(target_cell, header)
             self._update_dimension(sheet_name, 1, column_number)
 
+    @staticmethod
+    def _column_attributes(root, column_number):
+        columns = root.find(f"{{{MAIN_NS}}}cols")
+        if columns is None:
+            return None
+        for column in columns.findall(f"{{{MAIN_NS}}}col"):
+            minimum = int(column.get("min", "1"))
+            maximum = int(column.get("max", str(minimum)))
+            if minimum <= column_number <= maximum:
+                return {
+                    key: value
+                    for key, value in column.attrib.items()
+                    if key not in {"min", "max"}
+                }
+        return None
+
+    def copy_column_layout(self, sheet_name, template_sheet, column_count):
+        """Copy the first columns' widths/styles without disturbing later columns."""
+        target_root = self.sheet_root(sheet_name)
+        source_root = self.sheet_root(template_sheet)
+        overrides = {
+            column_number: self._column_attributes(source_root, column_number)
+            for column_number in range(1, column_count + 1)
+        }
+
+        columns = target_root.find(f"{{{MAIN_NS}}}cols")
+        if columns is None:
+            columns = etree.Element(f"{{{MAIN_NS}}}cols")
+            sheet_data = self._sheet_data(target_root)
+            target_root.insert(target_root.index(sheet_data), columns)
+
+        retained = []
+        for column in columns.findall(f"{{{MAIN_NS}}}col"):
+            minimum = int(column.get("min", "1"))
+            maximum = int(column.get("max", str(minimum)))
+            if maximum <= column_count:
+                continue
+            attributes = dict(column.attrib)
+            if minimum <= column_count:
+                attributes["min"] = str(column_count + 1)
+            retained.append(attributes)
+
+        for column in list(columns):
+            columns.remove(column)
+        for column_number, attributes in overrides.items():
+            if attributes is None:
+                continue
+            etree.SubElement(
+                columns,
+                f"{{{MAIN_NS}}}col",
+                {"min": str(column_number), "max": str(column_number), **attributes},
+            )
+        for attributes in sorted(retained, key=lambda item: int(item["min"])):
+            etree.SubElement(columns, f"{{{MAIN_NS}}}col", attributes)
+
+    def set_auto_filter(self, sheet_name, column_count):
+        """Set a valid sheet filter and repair its local FilterDatabase name."""
+        last_row = max(1, self.last_data_row(sheet_name))
+        last_column = get_column_letter(column_count)
+        filter_ref = f"A1:{last_column}{last_row}"
+        root = self.sheet_root(sheet_name)
+        auto_filter = root.find(f"{{{MAIN_NS}}}autoFilter")
+        if auto_filter is None:
+            auto_filter = etree.Element(
+                f"{{{MAIN_NS}}}autoFilter", {"ref": filter_ref}
+            )
+            sheet_data = self._sheet_data(root)
+            root.insert(root.index(sheet_data) + 1, auto_filter)
+        else:
+            auto_filter.set("ref", filter_ref)
+
+        defined_names = self.workbook_root.find(f"{{{MAIN_NS}}}definedNames")
+        if defined_names is None:
+            defined_names = etree.Element(f"{{{MAIN_NS}}}definedNames")
+            sheets = self.workbook_root.find(f"{{{MAIN_NS}}}sheets")
+            self.workbook_root.insert(
+                self.workbook_root.index(sheets) + 1, defined_names
+            )
+
+        local_sheet_id = str(self.sheet_names.index(sheet_name))
+        matching_name = None
+        for defined_name in defined_names.findall(f"{{{MAIN_NS}}}definedName"):
+            if (
+                defined_name.get("name") == "_xlnm._FilterDatabase"
+                and defined_name.get("localSheetId") == local_sheet_id
+            ):
+                matching_name = defined_name
+                break
+        if matching_name is None:
+            matching_name = etree.SubElement(
+                defined_names,
+                f"{{{MAIN_NS}}}definedName",
+                {
+                    "name": "_xlnm._FilterDatabase",
+                    "localSheetId": local_sheet_id,
+                    "hidden": "1",
+                },
+            )
+        escaped_sheet_name = sheet_name.replace("'", "''")
+        matching_name.text = (
+            f"'{escaped_sheet_name}'!$A$1:${last_column}${last_row}"
+        )
+
     def last_data_row(self, sheet_name):
         last = 1
         for row in self.rows(sheet_name):
@@ -1193,7 +1317,12 @@ def period_from_sheet_name(sheet_name, suffix=None):
 def main_detail_sheet(sheet_name):
     return any(
         period_from_sheet_name(sheet_name, suffix) is not None
-        for suffix in ("Store Details", "Dot Com Details", "Vape Details")
+        for suffix in (
+            "Store Details",
+            "Dot Com Details",
+            "Vape Details",
+            "CNC Details",
+        )
     )
 
 
@@ -1286,6 +1415,24 @@ def map_dot_com_row(row):
     ]
 
 
+def map_cnc_row(row):
+    asked_for_id = clean_text(row.get(STAFF_ASKED_ID))
+    if not asked_for_id:
+        confirmation = clean_text(row.get(CNC_ASKED_ID)).casefold()
+        if "not asked" in confirmation:
+            asked_for_id = "No"
+        elif "asked" in confirmation:
+            asked_for_id = "Yes"
+    return [
+        int(row["_store_number"]),
+        clean_text(row["site_name"]),
+        row["_visit_date"],
+        row["_visit_time"],
+        clean_text(row["primary_result"]).lower(),
+        asked_for_id or None,
+    ]
+
+
 def map_whoosh_row(row):
     return [
         int(row["_store_number"]),
@@ -1310,11 +1457,17 @@ def updated_report_filename(original_name, reporting_week, reporting_years):
 
     replacement = f"(Week {reporting_week})"
     updated, count = re.subn(
-        r"\(\s*Week\s*\d+\s*\)", replacement, stem, flags=re.I
+        r"\(\s*Week\s*(?:\d+|X+)\s*(?:Including\s+CNC)?\s*\)",
+        replacement,
+        stem,
+        flags=re.I,
     )
     if count == 0:
         updated, count = re.subn(
-            r"\bWeek\s*\d+\b", f"Week {reporting_week}", stem, flags=re.I
+            r"\bWeek\s*(?:\d+|X+)\b(?:\s+Including\s+CNC)?",
+            f"Week {reporting_week}",
+            stem,
+            flags=re.I,
         )
     if count == 0:
         updated = f"{stem} {replacement}"
@@ -1510,6 +1663,7 @@ def generate_reports(
     main_seen = main.existing_visit_keys(main_detail_sheet)
     whoosh_seen = whoosh.existing_visit_keys(whoosh_period_sheet)
     touched_main_sheets = {}
+    touched_cnc_sheets = set()
     touched_whoosh_periods = set()
 
     for _, row in export.iterrows():
@@ -1550,19 +1704,33 @@ def generate_reports(
             suffix = "Vape Details"
             headers = VAPE_HEADERS
             values = map_store_row(row, include_till=False)
+        elif audit_type == CLICK_COLLECT:
+            suffix = "CNC Details"
+            headers = CNC_HEADERS
+            values = map_cnc_row(row)
         else:
             continue
 
         sheet_name = get_main_period_sheet(main, period, suffix)
-        template_sheet = find_main_template(main, suffix, headers, period)
+        if audit_type == CLICK_COLLECT:
+            template_sheet = find_main_template(
+                main, "Store Details", STORE_HEADERS, period
+            )
+            main.copy_column_layout(sheet_name, template_sheet, len(headers))
+        else:
+            template_sheet = find_main_template(main, suffix, headers, period)
         main.ensure_headers(sheet_name, headers, template_sheet)
         main.append_values(sheet_name, values, template_sheet)
         touched_main_sheets[sheet_name] = len(headers)
+        if audit_type == CLICK_COLLECT:
+            touched_cnc_sheets.add(sheet_name)
         main_seen.add(key)
         stats[audit_type]["Added"] += 1
 
     for sheet_name, column_count in touched_main_sheets.items():
         main.sort_data_rows(sheet_name, column_count)
+    for sheet_name in touched_cnc_sheets:
+        main.set_auto_filter(sheet_name, len(CNC_HEADERS))
 
     for period in touched_whoosh_periods:
         sheet_name = get_whoosh_period_sheet(whoosh, period)
@@ -1624,7 +1792,7 @@ def main():
     )
     st.title("Tesco Ireland Weekly Report Generator")
     st.caption(
-        f"Version {APP_VERSION} — chronological sorting, annual rollover and Deliveroo raw data added"
+        f"Version {APP_VERSION} - Click & Collect, chronological sorting, annual rollover and Deliveroo raw data"
     )
     st.write(
         "Upload the latest audits export, Tesco calendar and the most recent "
@@ -1639,6 +1807,7 @@ The app will:
 - map Alcohol audits to **Px Store Details**
 - map Supermarket Home Delivery audits to **Px Dot Com Details**
 - map E-Cig audits to **Px Vape Details**
+- map Click & Collect audits to **Px CNC Details**
 - map Rapid Delivery audits to the Whoosh **Px** tabs
 - de-duplicate visits using Store Number, local visit date and local visit time
 - sort each updated tab chronologically by visit date and visit time
