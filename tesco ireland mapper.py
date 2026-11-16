@@ -22,8 +22,8 @@ from openpyxl.utils.datetime import (
 )
 
 
-# Version 1.5.0 adds Click & Collect reporting for Tesco's 2026-2027 template.
-APP_VERSION = "1.5.0"
+# Version 1.5.2 supports title-only and question-ID-prefixed audit exports.
+APP_VERSION = "1.5.2"
 
 
 ALCOHOL = "Alcohol"
@@ -93,6 +93,9 @@ RAPID_AGE = "What is your age?"
 RAPID_ASKED_AGE = "Did the driver ask your age?"
 RAPID_ASKED_DOB = "Did the driver ask for your date of birth?"
 RAPID_ENTERED_DOB = "Did the driver input your date of birth into their device?"
+# Retain these legacy output columns, but leave them blank when the survey no
+# longer includes them. ID scanning is a separate question, not a DOB answer.
+OPTIONAL_DELIVEROO_QUESTIONS = frozenset({RAPID_ASKED_DOB, RAPID_ENTERED_DOB})
 RAPID_SIGNED = "Were you asked to sign for delivery?"
 RAPID_DAMAGED = "Were any of the items damaged?"
 RAPID_DRIVER_GENDER = "What was the gender of the driver?"
@@ -377,8 +380,41 @@ def read_csv_bytes(csv_bytes, label):
     return df
 
 
+def read_audit_export(export_bytes):
+    """Resolve both export formats to the question titles used by the mapper."""
+    source = read_csv_bytes(export_bytes, "The audits export")
+    groups = {}
+    for column in source.columns:
+        match = re.match(r"^Q(\d+)\s*-\s*(.+)$", column, flags=re.I)
+        question_id, title = (match.group(1), clean_text(match.group(2))) if match else (None, column)
+        # Q363 is the online-shopping explanation; the legacy export's shared
+        # score-reason column contains the delivery explanation (Q95). Keep the
+        # two distinct rather than silently substituting the online response.
+        if question_id == "363" and title == RAPID_SCORE_REASON:
+            title = "Please explain the reason for your online shopping score:"
+        groups.setdefault(title, []).append(column)
+
+    resolved = {}
+    for title, columns in groups.items():
+        if len(columns) == 1:
+            resolved[title] = source[columns[0]]
+            continue
+        values = source[columns].copy()
+        for column in columns:
+            values.loc[values[column].map(clean_text).eq(""), column] = pd.NA
+        # Identical titles in separate surveys (e.g. signing for delivery) are
+        # separate columns in the new export. Combine their populated rows.
+        conflicts = values.nunique(axis=1, dropna=True).gt(1)
+        if conflicts.any():
+            raise ValueError(
+                "The audits export has conflicting answers for question: " + title
+            )
+        resolved[title] = values.bfill(axis=1).iloc[:, 0].fillna("")
+    return pd.DataFrame(resolved, index=source.index)
+
+
 def read_export(export_bytes):
-    df = read_csv_bytes(export_bytes, "The audits export")
+    df = read_audit_export(export_bytes)
     missing = sorted(BASE_EXPORT_COLUMNS - set(df.columns))
     if missing:
         raise KeyError("The export is missing required column(s): " + ", ".join(missing))
@@ -1542,7 +1578,7 @@ def generate_deliveroo_raw_data(
     previous_raw_name="Deliveroo Whoosh Ireland Raw Data.csv",
     output_date=None,
 ):
-    export = read_csv_bytes(export_bytes, "The audits export")
+    export = read_audit_export(export_bytes)
     previous = read_csv_bytes(
         previous_raw_bytes, "The previous Deliveroo raw-data file"
     )
@@ -1551,7 +1587,7 @@ def generate_deliveroo_raw_data(
         "item_to_order",
         "site_code",
         *DELIVEROO_RAW_SOURCE_MAP.values(),
-    }
+    } - OPTIONAL_DELIVEROO_QUESTIONS
     missing_export = sorted(required_export_columns - set(export.columns))
     if missing_export:
         raise KeyError(
@@ -1562,6 +1598,9 @@ def generate_deliveroo_raw_data(
         raise KeyError(
             "The previous Deliveroo raw-data file is missing the VISIT column."
         )
+
+    for question in OPTIONAL_DELIVEROO_QUESTIONS - set(export.columns):
+        export[question] = ""
 
     rapid = export[
         export["item_to_order"].map(normalise_header)
